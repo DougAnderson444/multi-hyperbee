@@ -1,12 +1,16 @@
 const Hyperbee = require('hyperbee')
 const hypercore = require('hypercore')
-const { isEqual, size, extend } = require('lodash')
+const auth = require('hypercore-peer-auth')
+const Protocol = require('hypercore-protocol')
 const Union = require('sorted-union-stream')
+const pump = require('pump')
+const { isEqual, size, extend } = require('lodash')
+
 const Clock = require('./clock')
 const MergeHandler = require('./mergeHandler')
 const { Timestamp, MutableTimestamp } = require('./timestamp')()
 
-const KEY_TO_PEERS = '__peers'
+const RELATED_FEEDS = '__peers'
 // This implementation uses HLC Clock implemented by James Long in his crdt demo app
 class MultiHyperbee extends Hyperbee {
   constructor(storage, options, customMergeHandler) {
@@ -19,7 +23,7 @@ class MultiHyperbee extends Hyperbee {
       peersListKey = metadata.contentFeed
     // Save the key to peers in the head block
     if (!peersListKey)
-      extend(options.metadata, {contentFeed: KEY_TO_PEERS})
+      extend(options.metadata, {contentFeed: RELATED_FEEDS})
 
     super(feed, options) // this creates the store
 
@@ -44,7 +48,13 @@ class MultiHyperbee extends Hyperbee {
       diffStorage = this.storage // storage function chosen by user: could be ram, ras3, etc.
 
     this.diffFeed = hypercore(diffStorage)
-    this.diffHyperbee = new Hyperbee(this.diffFeed, this.options)
+
+    let options = { ...this.options }
+    options.metadata = {
+      contentFeed: 'multi-hyperbee-diff'
+    }
+
+    this.diffHyperbee = new Hyperbee(this.diffFeed, options)
 
     await this.diffHyperbee.ready()
 
@@ -82,7 +92,7 @@ class MultiHyperbee extends Hyperbee {
     await this._init
     await super.del(key)
   }
-  async put(key, value, noDiff) {
+  async put(key, value, noDiff, isNew) {
     await this._init
     if (key === this.peerListKey) {
       super.put(key, value)
@@ -101,12 +111,19 @@ class MultiHyperbee extends Hyperbee {
       timestamp = Timestamp.send(this.clock.getClock()).toString().slice(0, 29)
     let diff = value._diff
     delete value._diff
-    let cur = await this.get(key)
+
+    let cur = !isNew  && await this.get(key)
 
     value._timestamp = timestamp
-    const prevTimestamp = cur && cur.value._timestamp
+    let prevTimestamp, prevSeq
+    if (cur) {
+      prevTimestamp = cur.value._timestamp
+      prevSeq = cur.seq
+    }
     if (prevTimestamp)
       value._prevTimestamp = prevTimestamp
+    if (prevSeq)
+      value._prevSeq = prevSeq
 
     await super.put(key, value)
     if (diff) {
@@ -137,12 +154,52 @@ class MultiHyperbee extends Hyperbee {
     return await this._addPeer(key)
   }
 
+  async replicate(isInitiator, options) {
+    await this._init
+    const { stream } = options
+    if (!stream)
+      return this.diffFeed.replicate(isInitiator, options)
+
+    return await this._joinMainStream(isInitiator, stream)
+  }
+  async _joinMainStream(isInitiator, stream) {
+    const protocol = new Protocol(isInitiator)
+
+    // pump(stream, protocol, stream)
+    const { key, secretKey } = this.diffFeed
+
+    let peer
+    let self = this
+    auth(protocol, {
+      authKeyPair: {
+        publicKey: key,
+        secretKey
+      },
+      onauthenticate (peerAuthKey, cb) {
+        let peerAuthKeyStr = peerAuthKey.toString('hex')
+        const { sources } = self
+        for (const key in sources) {
+          if (key === peerAuthKeyStr) {
+            peer = sources[key]
+            return cb(null, true)
+          }
+        }
+        cb(null, false)
+      },
+      onprotocol: async (protocol) => {
+        await self.diffFeed.replicate(isInitiator, {stream: protocol, live: true})
+        peer.feed.replicate(!isInitiator, {stream: protocol, live: true})
+      }
+    })
+    return protocol
+  }
+
   async _restorePeers() {
     let hs = this.feed.createReadStream({start: 0, end: 1})
     let entries = await this._collect(hs)
     let peerListKey = entries[0].toString().split('\n')[2]
     this.peerListKey = peerListKey.replace(/[^a-zA-Z0-9_]/g, '')
-    debugger
+    // debugger
 
     let peerList = await this._get(this.peerListKey)
     if (!peerList || !peerList.value ||  !peerList.value.length)
@@ -181,12 +238,13 @@ class MultiHyperbee extends Hyperbee {
     if (!key)
       throw new Error('Key is expected')
     let sortedStreams = []
+    let lte = `${key.split('/').slice(0, -1).join('/')}/\uffff`
+    let query = { gte: key, lte }
     for (let s in this.sources) {
       let hb  = this.sources[s]
-      sortedStreams.push(
-        hb.createReadStream({ gte: key, lte: key.split('/').splice(0, -1).join('/') })
-      )
+      sortedStreams.push(hb.createReadStream(query))
     }
+    sortedStreams.push(this.diffHyperbee.createReadStream(query))
     if (sortedStreams.length === 1)
       return sortedStreams[0]
     let union
@@ -204,8 +262,8 @@ class MultiHyperbee extends Hyperbee {
   async _get(key) {
     return super.get(key)
   }
-  async _put(key, value) {
-    await this.put(key, value, true)
+  async _put(key, value, isNew) {
+    await this.put(key, value, true, isNew)
   }
   async _addPeer(key, allPeersKeyStrings) {
     const keyString = key.toString('hex')
@@ -235,9 +293,6 @@ class MultiHyperbee extends Hyperbee {
 
     return peer
   }
-  // replicate(isInitiator, options) {
-  //   return this.diffFeed.replicate(isInitiator, options)
-  // }
   async _addRemovePeer(keyString, isAdd) {
     let peersList
     try {
@@ -286,7 +341,7 @@ class MultiHyperbee extends Hyperbee {
       rs.on('data', async (data) => {
         let { key, seq, value } = data
         newSeqs.push(seq)
-        if (!value) //  &&  key.trim().replace(/[^a-zA-Z0-9_]/g, '') === KEY_TO_PEERS)
+        if (!value) //  &&  key.trim().replace(/[^a-zA-Z0-9_]/g, '') === RELATED_FEEDS)
           return
 
         let {millis, counter, node} = this._parseTimestamp(value._timestamp)
